@@ -1,0 +1,13 @@
+services:
+  seatpool:
+    build: .
+    ports:
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - seatpool_data:/data
+    environment:
+      - SEATPOOL_DB=/data/gsuite_seatpool.db
+    restart: unless-stopped
+
+volumes:
+  seatpool_data:
