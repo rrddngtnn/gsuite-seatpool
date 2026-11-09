@@ -60,7 +60,7 @@ def _git(repo_root: Path, *args: str) -> str:
 
 def scan_paths(repo_root: Path) -> GateResult:
     res = GateResult()
-    files = [ln.strip() for ln in _git(repo_root, "ls-files").splitlines() if ln.strip()]
+    files = sorted(set(filter(None, _git(repo_root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0"))))
     res.scanned = len(files)
     for rel in files:
         if any(rel.startswith(prefix) for prefix in FORBIDDEN_PATH_GLOBS) or rel.endswith((".db", ".sqlite", ".csv")):
@@ -70,7 +70,7 @@ def scan_paths(repo_root: Path) -> GateResult:
 
 def scan_worktree_files(repo_root: Path) -> GateResult:
     res = GateResult()
-    files = [ln.strip() for ln in _git(repo_root, "ls-files").splitlines() if ln.strip()]
+    files = sorted(set(filter(None, _git(repo_root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0"))))
     compiled = [
         (p, re.compile(p.regex))
         for p in PATTERNS

@@ -1,4 +1,4 @@
-"""Tests for Cloud Identity 50-seat generation, CSV formatting, and Admin SDK Directory API."""
+"""Tests for local seat generation, CSV formatting, and Admin SDK Directory API."""
 from __future__ import annotations
 
 import csv
@@ -16,14 +16,17 @@ from directory_seats.generator import (
 )
 
 
-def test_seat_generation_deterministic():
+def test_seat_generation_has_stable_identity_but_fresh_secrets():
     s1 = make_seat("alpha.example.test", 1)
     s2 = make_seat("alpha.example.test", 1)
-    s3 = make_seat("beta.example.test", 1)
-    assert s1 == s2
+    assert redact_seat(s1) == redact_seat(s2)
     assert s1["email"] == "unit01@alpha.example.test"
-    assert s1["password"] != s3["password"]
+    assert s1["password"] != s2["password"]
     assert s1["change_password_at_next_login"] is False
+
+
+def test_seat_password_has_at_least_24_characters():
+    assert len(make_seat("alpha.example.test", 1)["password"]) >= 24
 
 
 def test_seat_password_policy():
@@ -36,13 +39,11 @@ def test_seat_password_policy():
     assert any(not c.isalnum() for c in pw)
 
 
-def test_cloud_identity_50_seat_ceiling_enforced():
-    seats = generate_domain_seats("alpha.example.test", count=CLOUD_IDENTITY_FREE_CAP)
-    assert len(seats) == 50
-    with pytest.raises(ValueError):
-        generate_domain_seats("alpha.example.test", count=51)
-    with pytest.raises(ValueError):
-        make_seat("alpha.example.test", 51)
+def test_legacy_constant_preserves_local_default_not_a_ceiling():
+    assert CLOUD_IDENTITY_FREE_CAP == 50
+    seats = generate_domain_seats("alpha.example.test")
+    assert len(seats) == CLOUD_IDENTITY_FREE_CAP
+    assert make_seat("alpha.example.test", 51)["email"] == "unit51@alpha.example.test"
 
 
 def test_redact_seat_strips_password():

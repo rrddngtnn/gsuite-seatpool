@@ -20,7 +20,7 @@ def _seed_domains(db, domains: list[str], seats_per_domain: int = 5):
     for fqdn in domains:
         tid = upsert_tenant_domain(db, fqdn, "AdminPass123!", max_seats=seats_per_domain)
         for s in generate_domain_seats(fqdn, count=seats_per_domain):
-            add_seat(db, tid, s)
+            add_seat(db, tid, s, status="provisioned")
 
 
 def test_round_robin_interleaves_domains(db):
@@ -96,6 +96,12 @@ def test_cli_end_to_end(tmp_path, capsys):
     ]) == 0
     out_csv = json.loads(capsys.readouterr().out)
     assert len(out_csv["csv_files"]) == 2
+
+    from seat_allocator.store import open_db
+    connection = open_db(db_path)
+    connection.execute("UPDATE seats SET status='provisioned'")
+    connection.commit()
+    connection.close()
 
     assert cli_main([
         "--db", db_path,

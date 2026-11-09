@@ -1,35 +1,43 @@
-# Architecture & Operational Contracts
+# Architecture and operational contracts
 
-## 1. Split-Brain Identity and Mail Routing
+## Boundaries
 
-Google Workspace Business Starter charges per mailbox. Cloud Identity Free provides the same Google Account OAuth identity (`accounts.google.com`) and Admin Console (`admin.google.com`) directory management for up to 50 users per domain at zero cost, without Gmail mailbox provisioning.
+Google Directory manages Google identities. DNS adapters publish records. External mail services deliver messages; the MIME ingester only processes supplied files/stdin. None of these operations alone proves the others succeeded.
 
-By keeping `MX` records pointed at a catch-all mail relay (`forwardemail`, `improvmx`, or a self-hosted SMTP listener) while verifying the domain in Google Admin Console via a `TXT` record (`google-site-verification=...`):
+## Configuration and providers
 
-1. Directory users (`unit01@domain.tld` .. `unit50@domain.tld`) authenticate via Google OAuth (`Sign in with Google`) without requiring SMS verification during creation.
-2. Inbound verification emails and OTP codes sent to `unitXX@domain.tld` route through the catch-all `MX` into a single consolidated mailbox or SQLite table (`inbox_messages`).
+The CLI resolves flags over exported environment over versioned TOML over defaults. DNS uses a provider factory with manual, registrar REST, and Cloudflare implementations. Python integrations and CLI configuration can load factories from `gsuite_seatpool.dns` entry points.
 
-## 2. Registrar DNS API Contract
-
-Verified endpoint contract for domain zone management:
+The registrar adapter implements this specific contract:
 
 ```text
-GET    /api/domains/<fqdn>/dns                 -> 200 {"records": [...], "supported_types": [...]}
-POST   /api/domains/<fqdn>/dns                 -> 201 {"record": {"id", "type", "name", "value", "ttl", "priority"}}
-DELETE /api/domains/<fqdn>/dns/<record_id>     -> 200 {"ok": true}
-PUT    /api/domains/<fqdn>/nameservers         -> 200 {"ok": true}
+POST   /api/auth/login                   -> 200 {user: ...}
+GET    /api/domains/<fqdn>/dns            -> 200 {records: [...]}
+POST   /api/domains/<fqdn>/dns            -> 201 {record: ...}
+DELETE /api/domains/<fqdn>/dns/<id>       -> 200 {...}
+PUT    /api/domains/<fqdn>/nameservers    -> 200 {...}
 ```
 
-Validation errors returned by the mock handler:
-- `400 unsupported_record_type`: `type` missing or outside `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `NS`.
-- `400 empty_record_value`: `value` empty.
-- `400 invalid_record_name`: `name` contains illegal hostname characters.
-- `400 invalid_record_value`: `A` value is not IPv4 or `MX` value is not a valid FQDN.
-- `400 invalid_nameservers`: fewer than 2 nameservers supplied to `PUT /nameservers`.
+This is not a universal registrar API. New APIs need adapters.
 
-## 3. Round-Robin Seat Allocation
+Google authentication is injected into the Directory client. Authorized-user and delegated service-account credentials refresh through google-auth. Bearer-token mode leaves token lifecycle to the caller. Paginated reads retry bounded transient HTTP failures; creates are not blindly retried.
 
-Registering consecutive accounts from a single custom domain (`unit01@domainA`, `unit02@domainA`, ...) triggers domain-level clustering heuristics on target platforms. `seat_allocator.allocate_round_robin()` enforces two invariants:
+## Lifecycle
 
-1. **Cross-Domain Interleaving**: For `D` active domains, allocation `i` selects from domain `i mod D` before advancing to seat index `2` on any domain.
-2. **Per-Domain Daily Target Ceiling**: Each `(fqdn, target)` pair is capped at `max_per_domain_day` allocations within a rolling 24-hour window.
+- `init-tenant` stages local inventory; it does not create an organization.
+- `plan` reads local pending inventory without network or database writes.
+- DNS verification TXT submission sets `dns_pending`, never `verified`.
+- Manual DNS emits `planned` operations without claiming remote readiness.
+- Sync lists existing users first, creates missing primary addresses, and commits each successful local update independently.
+- Reconcile reads remote users and updates matching local staged seats. It marks suspended/archived remote users suspended locally and previously provisioned absent users missing after a complete listing. It does not delete or recreate remote users or reset passwords.
+- Allocation selects only locally `provisioned` seats. CLI output removes passwords; explicit CSV export retains them.
+
+## Remaining model limitations
+
+The legacy `tenants` table represents domain inventories. Explicit `organizations` and `organization_domains` tables associate inventories and enforce shared operator-planned reservations. Legacy domains remain unlinked on migration. Capacity is not a live Google licensing entitlement. Generation has no hard 50-seat ceiling; 50 is a local default. The mock retains a simulated quota for error tests.
+
+New passwords use cryptographic randomness; existing credentials survive reinitialization. New DB/CSV files use private permissions and reject symlink destinations. Credentials remain plaintext. Read-only IMAP SSL ingestion uses persistent account/mailbox + UIDVALIDITY + UID checkpoints with atomic batch ingestion. Latest-batch fetching is not full historical backfill. REST MIME ingestion uses an explicit HTTPS JSON contract with bounded same-origin pagination and atomic account/message-ID checkpoints. No live license discovery is claimed.
+
+## Verification boundary
+
+Automated tests use local temporary databases and provider doubles. Passing these checks demonstrates tested behavior, not live provider eligibility, Google verification, or email deliverability. Provider integration checks must be explicitly scoped before contacting real services.

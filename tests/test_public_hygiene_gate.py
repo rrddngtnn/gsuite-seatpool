@@ -23,6 +23,13 @@ def _init_temp_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def test_untracked_publish_candidate_is_scanned(tmp_path):
+    repo = _init_temp_repo(tmp_path)
+    (repo / "new.py").write_text('HOST = "45.67.89.10"\n', encoding="utf-8")
+    report = run_all_gates_for_test(repo)
+    assert report["gates"]["worktree_content"]["status"] == "fail"
+
+
 def test_clean_repo_passes_hygiene_gate(tmp_path):
     repo = _init_temp_repo(tmp_path)
     (repo / "README.md").write_text("# Clean Repository\n\nEndpoint: http://127.0.0.1:8788\n", encoding="utf-8")

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+from pathlib import Path
 import sqlite3
+import stat
 
 from catchall_mail.router import ParsedMail
 
-TENANT_STATUSES = ("staged", "dns_ready", "verified", "active", "suspended", "dead")
-SEAT_STATUSES = ("ready", "provisioned", "suspended", "dead")
+TENANT_STATUSES = ("staged", "dns_pending", "dns_ready", "verified", "active", "suspended", "dead")
+SEAT_STATUSES = ("ready", "provisioned", "suspended", "missing", "dead")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -25,6 +28,20 @@ CREATE TABLE IF NOT EXISTS tenants (
   created_at         TEXT NOT NULL,
   updated_at         TEXT NOT NULL
 );
+
+-- Organization linkage is explicit: legacy inventory remains unlinked.
+-- Capacity is operator-planned inventory, not a statement of Google licensing.
+CREATE TABLE IF NOT EXISTS organizations (
+  organization_key TEXT PRIMARY KEY NOT NULL,
+  capacity INTEGER NOT NULL CHECK(capacity > 0)
+);
+
+CREATE TABLE IF NOT EXISTS organization_domains (
+  tenant_id INTEGER PRIMARY KEY REFERENCES tenants(id),
+  organization_key TEXT NOT NULL REFERENCES organizations(organization_key)
+);
+CREATE INDEX IF NOT EXISTS ix_organization_domains_key
+  ON organization_domains(organization_key);
 
 CREATE TABLE IF NOT EXISTS dns_records (
   id          INTEGER PRIMARY KEY,
@@ -96,10 +113,91 @@ def utcnow() -> str:
 
 
 def open_db(path: str = "gsuite_seatpool.db") -> sqlite3.Connection:
-    db = sqlite3.connect(path)
-    db.executescript(SCHEMA)
-    db.row_factory = sqlite3.Row
-    return db
+    path = os.fspath(path)
+    if path == ":memory:":
+        db = sqlite3.connect(path)
+    else:
+        # Exclusive creation sets permissions before SQLite can write credentials.
+        # O_NOFOLLOW also rejects dangling links; never chmod an existing file.
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        created = False
+        try:
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            fd = os.open(path, flags)
+        try:
+            if created:
+                os.fchmod(fd, 0o600)
+            original = os.fstat(fd)
+            if not stat.S_ISREG(original.st_mode):
+                raise ValueError("Database path must be a regular file")
+            uri = Path(os.path.abspath(path)).as_uri() + "?mode=rw"
+            db = sqlite3.connect(uri, uri=True)
+            current = os.stat(path, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                db.close()
+                raise ValueError("Database path changed while opening")
+        finally:
+            os.close(fd)
+    try:
+        db.executescript(SCHEMA)
+        db.row_factory = sqlite3.Row
+        return db
+    except Exception:
+        db.close()
+        raise
+
+
+def organization_capacity(db: sqlite3.Connection, organization_key: str) -> dict:
+    """Return local planned capacity; this does not verify licensing or provisioning."""
+    row = db.execute(
+        "SELECT capacity FROM organizations WHERE organization_key=?", (organization_key,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown organization: {organization_key}")
+    domains = [row[0] for row in db.execute(
+        "SELECT t.fqdn FROM tenants t JOIN organization_domains d ON d.tenant_id=t.id "
+        "WHERE d.organization_key=? ORDER BY t.fqdn", (organization_key,)
+    )]
+    reserved = db.execute(
+        "SELECT COUNT(*) FROM seats s JOIN organization_domains d ON d.tenant_id=s.tenant_id "
+        "WHERE d.organization_key=? AND s.status!='dead'", (organization_key,)
+    ).fetchone()[0]
+    return {"organization_key": organization_key, "capacity": row[0],
+            "reserved": reserved, "available": row[0] - reserved, "domains": domains}
+
+
+def upsert_organization(db: sqlite3.Connection, organization_key: str, capacity: int) -> None:
+    """Declare an operator-managed organization and its planned seat capacity."""
+    if not isinstance(organization_key, str) or not organization_key.strip():
+        raise ValueError("organization_key must be non-empty")
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("capacity must be a positive integer")
+    with db:
+        db.execute(
+            "INSERT INTO organizations(organization_key, capacity) VALUES(?, ?) "
+            "ON CONFLICT(organization_key) DO UPDATE SET capacity=excluded.capacity",
+            (organization_key, capacity),
+        )
+        if organization_capacity(db, organization_key)["available"] < 0:
+            raise ValueError("Organization planned capacity exceeded")
+
+
+def link_domain(db: sqlite3.Connection, organization_key: str, fqdn: str) -> None:
+    """Explicitly associate an existing inventory domain with an organization."""
+    organization_capacity(db, organization_key)
+    tenant = db.execute("SELECT id FROM tenants WHERE fqdn=?", (fqdn.strip().lower(),)).fetchone()
+    if tenant is None:
+        raise ValueError(f"Unknown domain: {fqdn}")
+    with db:
+        db.execute(
+            "INSERT INTO organization_domains(tenant_id, organization_key) VALUES(?, ?) "
+            "ON CONFLICT(tenant_id) DO UPDATE SET organization_key=excluded.organization_key",
+            (tenant[0], organization_key),
+        )
+        if organization_capacity(db, organization_key)["available"] < 0:
+            raise ValueError("Organization planned capacity exceeded")
 
 
 def log_event(db: sqlite3.Connection, fqdn: str | None, kind: str, detail: str = "") -> None:
@@ -117,8 +215,8 @@ def upsert_tenant_domain(
     registrar_account: str | None = None,
     max_seats: int = 50,
 ) -> int:
-    if max_seats < 1 or max_seats > 50:
-        raise ValueError("max_seats must be between 1 and 50 (Cloud Identity Free cap)")
+    if type(max_seats) is not int or max_seats < 1:
+        raise ValueError("max_seats must be a positive integer")
     fqdn = fqdn.strip().lower()
     now = utcnow()
     db.execute(
@@ -168,24 +266,32 @@ def add_dns_record(
 def add_seat(db: sqlite3.Connection, tenant_id: int, seat: dict, status: str = "ready") -> int:
     if status not in SEAT_STATUSES:
         raise ValueError(f"Unknown seat status: {status}")
-    cur = db.execute(
-        "INSERT OR IGNORE INTO seats"
-        "(tenant_id, fqdn, seat_index, email, password, first_name, last_name, org_unit, status, created_at) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            tenant_id,
-            seat["fqdn"],
-            seat["seat_index"],
-            seat["email"],
-            seat["password"],
-            seat["first_name"],
-            seat["last_name"],
-            seat.get("org_unit", "/"),
-            status,
-            utcnow(),
-        ),
-    )
-    db.commit()
+    with db:
+        tenant = db.execute("SELECT fqdn FROM tenants WHERE id=?", (tenant_id,)).fetchone()
+        if tenant is None or tenant[0] != seat["fqdn"]:
+            raise ValueError("Seat domain must match an existing tenant")
+        cur = db.execute(
+            "INSERT OR IGNORE INTO seats"
+            "(tenant_id, fqdn, seat_index, email, password, first_name, last_name, org_unit, status, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                seat["fqdn"],
+                seat["seat_index"],
+                seat["email"],
+                seat["password"],
+                seat["first_name"],
+                seat["last_name"],
+                seat.get("org_unit", "/"),
+                status,
+                utcnow(),
+            ),
+        )
+        linked = db.execute(
+            "SELECT organization_key FROM organization_domains WHERE tenant_id=?", (tenant_id,)
+        ).fetchone()
+        if linked and organization_capacity(db, linked[0])["available"] < 0:
+            raise ValueError("Organization planned capacity exceeded")
     row = db.execute("SELECT id FROM seats WHERE email=?", (seat["email"],)).fetchone()
     return int(row["id"])
 
@@ -248,7 +354,7 @@ def counts(db: sqlite3.Connection) -> dict[str, int]:
         "tenants": q("SELECT COUNT(*) FROM tenants"),
         "dns_records": q("SELECT COUNT(*) FROM dns_records"),
         "seats": q("SELECT COUNT(*) FROM seats"),
-        "seats_ready": q("SELECT COUNT(*) FROM seats WHERE status IN ('ready','provisioned')"),
+        "seats_ready": q("SELECT COUNT(*) FROM seats WHERE status='provisioned'"),
         "allocations": q("SELECT COUNT(*) FROM allocations"),
         "inbox_messages": q("SELECT COUNT(*) FROM inbox_messages"),
     }

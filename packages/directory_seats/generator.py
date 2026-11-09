@@ -1,12 +1,17 @@
-"""Deterministic seat generation and Admin Console bulk CSV export under the 50-user Cloud Identity cap."""
+"""Stable seat identities, random secrets, and Admin Console bulk CSV export."""
 from __future__ import annotations
 
 import csv
 import hashlib
 import os
 import random
+import re
+import secrets
+import string
 
-CLOUD_IDENTITY_FREE_CAP = 50
+DEFAULT_SEAT_COUNT = 50
+# Backward-compatible name for the local default, not a Google quota.
+CLOUD_IDENTITY_FREE_CAP = DEFAULT_SEAT_COUNT
 
 ADMIN_CSV_HEADERS = [
     "First Name [Required]",
@@ -29,7 +34,6 @@ LAST_NAMES = [
     "Palmer", "Sutton",
 ]
 
-WORDS = ["Apex", "Core", "Edge", "Flux", "Grid", "Link", "Node", "Span"]
 SYMBOLS = "!@#$%&*"
 
 
@@ -38,16 +42,50 @@ def _rng(seed: str) -> random.Random:
 
 
 def seat_password(fqdn: str, index: int) -> str:
-    rng = _rng(f"seat-pw:{fqdn}:{index}")
-    return f"{rng.choice(WORDS)}{rng.randint(1000, 9999)}{rng.choice(SYMBOLS)}{rng.choice(WORDS).lower()}"
+    """Return a fresh secret; identity arguments remain for API compatibility.
+
+    Persist the result: calling again is not a password recovery mechanism.
+    """
+    alphabet = string.ascii_letters + string.digits + SYMBOLS
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(24))
+        if (
+            any(c.isupper() for c in password)
+            and any(c.islower() for c in password)
+            and any(c.isdigit() for c in password)
+            and any(c in SYMBOLS for c in password)
+        ):
+            return password
+
+
+def _validated_domain(fqdn: str) -> str:
+    if not isinstance(fqdn, str):
+        raise ValueError("Seat domain must be a valid fully qualified domain name")
+    fqdn = fqdn.strip().lower()
+    labels = fqdn.split(".")
+    if len(fqdn) > 253 or len(labels) < 2 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError("Seat domain must be a valid fully qualified domain name")
+    return fqdn
+
+
+def _validate_prefix(prefix: str, last_index: int) -> None:
+    if (
+        not isinstance(prefix, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", prefix)
+        or ".." in prefix
+        or len(prefix) + len(f"{last_index:02d}") > 64
+    ):
+        raise ValueError("Seat prefix must produce a valid email local part of at most 64 characters")
 
 
 def make_seat(fqdn: str, index: int, prefix: str = "unit", org_unit: str = "/") -> dict:
-    if index < 1 or index > CLOUD_IDENTITY_FREE_CAP:
-        raise ValueError(
-            f"Seat index {index} outside Cloud Identity Free limit (1..{CLOUD_IDENTITY_FREE_CAP})"
-        )
-    fqdn = fqdn.strip().lower()
+    if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+        raise ValueError("Seat index must be a positive integer")
+    fqdn = _validated_domain(fqdn)
+    _validate_prefix(prefix, index)
     rng = _rng(f"seat:{fqdn}:{index}")
     first = rng.choice(FIRST_NAMES)
     last = rng.choice(LAST_NAMES)
@@ -66,14 +104,14 @@ def make_seat(fqdn: str, index: int, prefix: str = "unit", org_unit: str = "/") 
 
 def generate_domain_seats(
     fqdn: str,
-    count: int = CLOUD_IDENTITY_FREE_CAP,
+    count: int = DEFAULT_SEAT_COUNT,
     prefix: str = "unit",
     org_unit: str = "/",
 ) -> list[dict]:
-    if count < 1 or count > CLOUD_IDENTITY_FREE_CAP:
-        raise ValueError(
-            f"Requested {count} seats; Cloud Identity Free ceiling is {CLOUD_IDENTITY_FREE_CAP} per domain"
-        )
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("Seat count must be a positive integer")
+    fqdn = _validated_domain(fqdn)
+    _validate_prefix(prefix, count)
     return [make_seat(fqdn, idx, prefix=prefix, org_unit=org_unit) for idx in range(1, count + 1)]
 
 
@@ -82,8 +120,18 @@ def redact_seat(seat: dict) -> dict:
 
 
 def export_admin_csv(seats: list[dict], output_path: str) -> str:
+    """Create a private credential export, refusing any existing destination.
+
+    Exclusive creation rejects both regular files and symlinks atomically.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
+    with open(
+        output_path,
+        "x",
+        newline="",
+        encoding="utf-8",
+        opener=lambda path, flags: os.open(path, flags, 0o600),
+    ) as f:
         writer = csv.writer(f)
         writer.writerow(ADMIN_CSV_HEADERS)
         for s in seats:

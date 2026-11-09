@@ -1,138 +1,145 @@
 # gsuite-seatpool
 
-Multi-domain DNS zone provisioner, Cloud Identity Free 50-seat directory generator, catch-all RFC5322 OTP router, and round-robin seat allocator.
+Configurable DNS provisioning, Google Directory user management, MIME ingestion, and local inventory allocation. Directory identities and mail delivery are separate: this tool does not provide Gmail mailboxes or create Google organizations.
 
-`gsuite-seatpool` decouples Google OAuth identity provisioning from paid mailbox licensing by pairing **Cloud Identity Free** directory seats (`50` seats/domain ceiling) with **registrar-level catch-all MX/TXT routing**. Run the pre-publish hygiene gate (`python3 scripts/public-hygiene-gate.py --repo-root .`) before any public push.
-
-1. **`dns_zone`**: Automate `TXT` (`google-site-verification=...`), `MX`, `SPF`, and nameserver delegation against registrar zone APIs.
-2. **`directory_seats`**: Deterministically generate up to 50 user seats per domain, export bulk CSVs matching the Google Admin Console schema (`Change Password at Next Sign-In = False`), or provision directly via the Admin SDK Directory v1 API (`POST /admin/directory/v1/users`).
-3. **`catchall_mail`**: Parse inbound RFC5322 MIME messages across catch-all domains (`*@domain.tld`) and extract 6-digit OTPs and verification URLs without post-signup timestamp truncation.
-4. **`seat_allocator`**: Allocate seats across domains in strict round-robin order while enforcing a per-domain, per-target daily budget (`max_per_domain_day`).
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       gsuite-seatpool CLI / Runner                      │
-└─────────┬───────────────────┬─────────────────────┬─────────────────────┘
-          │                   │                     │
-          ▼                   ▼                     ▼
-┌───────────────────┐ ┌───────────────────┐ ┌─────────────────────────────┐
-│     dns_zone      │ │  directory_seats  │ │        catchall_mail        │
-│ TXT verify + MX   │ │ 50-seat CSV / API │ │ RFC5322 MIME + OTP/URL poll │
-└─────────┬─────────┘ └─────────┬─────────┘ └──────────────┬──────────────┘
-          │                     │                          │
-          └─────────────────────┼──────────────────────────┘
-                                ▼
-                  ┌───────────────────────────┐
-                  │      seat_allocator       │
-                  │ Round-Robin + SQLite WAL  │
-                  └───────────────────────────┘
-```
-
-## Monorepo Layout
-
-| Package | Path | Responsibility |
-|---|---|---|
-| `dns_zone` | `packages/dns_zone` | Registrar DNS zone record CRUD (`A`, `AAAA`, `CNAME`, `TXT`, `MX`, `NS`) and catch-all presets (`forwardemail`, `improvmx`, `custom_mx`) |
-| `directory_seats` | `packages/directory_seats` | Deterministic seat seeding (`1..50`), Admin Console CSV exporter, and Google Admin SDK `directory_v1` client |
-| `catchall_mail` | `packages/catchall_mail` | Multipart MIME parser, OTP/URL regex extraction, and SQLite/in-memory inbox polling |
-| `seat_allocator` | `packages/seat_allocator` | SQLite persistence (`tenants`, `dns_records`, `seats`, `allocations`, `inbox_messages`, `events`) and round-robin allocator |
-| `gsuite_seatpool` | `packages/gsuite_seatpool` | Unified CLI and offline FastAPI mock server for registrar DNS and Google Directory APIs |
-
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/rrddngtnn/gsuite-seatpool
-cd gsuite-seatpool
-python3 -m pip install -e ".[dev]"
+python3 -m pip install -e '.[dev,google]'
+cp seatpool.example.toml seatpool.toml
 ```
 
-Or run directly from source:
+Python 3.10+ is supported. The full 331-test suite has been exercised locally on Python 3.10, 3.11, and 3.12 in separate environments; CI covers those versions. Python 3.10 uses the conditional `tomli` dependency. Google credential support is an optional `google` extra.
+
+## Configuration
+
+Resolution order: explicit CLI flags > environment > TOML > defaults. Environment variables must be exported; `.env` is not automatically loaded. See [seatpool.example.toml](seatpool.example.toml).
 
 ```bash
-export PYTHONPATH=packages
+export SEATPOOL_DB=./inventory.sqlite
+export GOOGLE_DIRECTORY_TOKEN='<your-short-lived-token>'
+gsuite-seatpool --config seatpool.toml doctor
 ```
 
-## Quickstart
+Environment settings include `SEATPOOL_DB`, `DNS_PROVIDER`, `REGISTRAR_BASE_URL`, `DIRECTORY_BASE_URL`, `GOOGLE_DIRECTORY_TOKEN`, `DIRECTORY_TOKEN`, `CATCHALL_TARGET`, `GOOGLE_DIRECTORY_CREDENTIALS_FILE`, `GOOGLE_DIRECTORY_SERVICE_ACCOUNT_FILE`, and `GOOGLE_DIRECTORY_DELEGATED_ADMIN`.
+
+DNS providers:
+
+- `manual`: emits planned records without claiming remote changes.
+- `registrar`: implements the specific REST contract in [architecture](docs/architecture.md), with optional `email_env` and `password_env` authentication. Changing its URL does not translate arbitrary APIs.
+- `cloudflare`: Cloudflare v4 DNS records with `zone_id` and `token_env`. Nameserver delegation is outside this adapter.
+
+The Python factory and CLI support installed third-party entry points in `gsuite_seatpool.dns`. Unknown providers fail when selected for a DNS operation.
+
+Google authentication supports a bearer token, an authorized-user credential file with refresh, or a service-account file with delegated administrator. API permissions and domain-wide delegation must already be configured. Never commit credential files.
+
+## Inventory workflow
 
 ```bash
-# Initialize two tenant domains (50 seats each = 100 seats)
-make init
+# Local inventory only; does not create Google users or organizations.
+gsuite-seatpool --config seatpool.toml init-tenant --fqdn team.example.test --seats 5
 
-# Export Google Admin Console bulk-upload CSVs
-make export-csv
+# Local read-only plan; no remote calls.
+gsuite-seatpool --config seatpool.toml plan --fqdn team.example.test
 
-# Allocate 4 seats for target "github" in round-robin order (max 2/domain/day)
-make allocate N=4 CAP=2
+# Read Google Directory and update matching local records.
+gsuite-seatpool --config seatpool.toml reconcile --fqdn team.example.test
 
-# Run offline test suite
-make test
+# Apply pending creations and commit each successful local result.
+gsuite-seatpool --config seatpool.toml sync-directory --fqdn team.example.test --limit 5
+
+gsuite-seatpool --config seatpool.toml status
 ```
 
-Sample `allocate` output:
+Sync lists remote users before creating missing primary addresses. It does not verify that an existing user's password matches local inventory. Reconcile never writes to Google. It marks remote suspended/archived users locally suspended and previously provisioned users absent from a complete listing as missing; neither is allocatable. It does not delete or recreate users.
+
+Only `provisioned` seats are allocatable. Normal allocation output omits passwords. CSV export explicitly writes credentials; protect it and the plaintext SQLite inventory.
+
+```bash
+gsuite-seatpool --config seatpool.toml export-csv --out-dir ./private/csv
+gsuite-seatpool --config seatpool.toml allocate --target internal-project --count 2
+```
+
+## DNS and mail
+
+```bash
+gsuite-seatpool --config seatpool.toml dns-verify --fqdn team.example.test --token google-site-verification=example-token
+gsuite-seatpool --config seatpool.toml dns-catchall --fqdn team.example.test --mode custom_mx --target mx.example.test
+gsuite-seatpool --config seatpool.toml inbox-ingest --file message.eml
+```
+
+TXT submission is `dns_pending`, not proof of Google verification. Catch-all presets generate DNS records only: forwarding rules, provider eligibility, and mail delivery must be checked separately. MIME files/stdin and read-only IMAP SSL ingestion are supported. An explicit REST MIME connector is also available (contract below); it is not an automatic translator for arbitrary mailbox APIs. IMAP fetches a bounded latest batch using UID and BODY.PEEK. Persistent checkpoints identify account/mailbox, UIDVALIDITY and UID; inbox rows and checkpoints commit atomically so repeat pulls do not duplicate messages. It still fetches only the latest bounded batch, not an unbounded historical backfill.
+
+## Shared organization inventory
+
+```bash
+gsuite-seatpool --config seatpool.toml org-init --key company --capacity 50
+gsuite-seatpool --config seatpool.toml org-link --key company --fqdn team.example.test
+gsuite-seatpool --config seatpool.toml org-status --key company
+```
+
+Capacity is operator-declared planned inventory, not a license request. All linked non-dead seats reserve capacity across domains; over-capacity mutations roll back.
+
+## IMAP ingestion
+
+Add this table to your private configuration, export the referenced credentials, then run `gsuite-seatpool --config seatpool.toml inbox-pull --limit 50`:
+
+```toml
+[mail]
+provider = "imap"
+host = "imap.example.test"
+port = 993
+mailbox = "INBOX"
+username_env = "MAIL_USERNAME"
+password_env = "MAIL_PASSWORD"
+```
+
+IMAP opens the mailbox read-only. Command output contains an ingestion count rather than message contents or credentials.
+
+## REST MIME ingestion
+
+Use a private configuration with an endpoint implementing this explicit contract:
+
+```toml
+[mail]
+provider = "rest"
+url = "https://mail.example.test/messages"
+bearer_env = "MAIL_API_TOKEN"
+max_pages = 10
+```
+
+Run `inbox-pull --limit 50` with your configuration. The endpoint receives GET requests with a remaining `limit` and returns:
 
 ```json
-{
-  "target": "github",
-  "requested": 4,
-  "allocated_count": 4,
-  "allocated": [
-    {
-      "seat_id": 1,
-      "fqdn": "alpha.example.test",
-      "seat_index": 1,
-      "email": "unit01@alpha.example.test",
-      "target": "github"
-    },
-    {
-      "seat_id": 51,
-      "fqdn": "beta.example.test",
-      "seat_index": 1,
-      "email": "unit01@beta.example.test",
-      "target": "github"
-    }
-  ],
-  "skipped_domains": {}
-}
+{"messages": [{"id": "stable-opaque-id", "raw": "To: user@example.test\r\n\r\nMessage body"}], "next": null}
 ```
 
-## Catch-All Routing Presets
+`next` can be a relative or same-origin HTTPS pagination link. Redirects and cross-origin pagination are rejected. Persistent `(account_id, id)` checkpoints and inbox records commit atomically. Account identity is derived from the exact endpoint URL: keep it stable and do not embed credentials in it. Token rotation through the same environment reference does not duplicate messages. Limits and page bounds prevent unbounded traversal; this contract does not match every mailbox vendor without an external adapter.
 
-| Preset | DNS Records Provisioned | External Account Required |
-|---|---|---|
-| `forwardemail` | `MX 10 mx1.forwardemail.net`, `MX 10 mx2.forwardemail.net`, `TXT forward-email=<target>`, `TXT v=spf1 ...` | No (configured via DNS TXT) |
-| `improvmx` | `MX 10 mx1.improvmx.com`, `MX 20 mx2.improvmx.com`, `TXT v=spf1 include:spf.improvmx.com ~all` | Yes (domain registered in ImprovMX) |
-| `custom_mx` | `MX 10 <target>` | Self-hosted SMTP / LMTP listener |
+## Packages
 
-## CLI Reference
+| Package | Responsibility |
+|---|---|
+| `dns_zone` | DNS adapters, factory, record presets |
+| `directory_seats` | Local generation, CSV export, Google auth and Directory API |
+| `catchall_mail` | MIME parsing, local ingestion, pattern extraction |
+| `seat_allocator` | SQLite inventory and provisioned-seat allocation |
+| `gsuite_seatpool` | TOML configuration, CLI, offline mock server |
 
-```bash
-gsuite-seatpool doctor
-gsuite-seatpool mock --host 127.0.0.1 --port 8788
-gsuite-seatpool init-tenant --fqdn alpha.example.test --seats 50
-gsuite-seatpool dns-verify --fqdn alpha.example.test --token google-site-verification=abc123
-gsuite-seatpool dns-catchall --fqdn alpha.example.test --mode forwardemail --target master@example.test
-gsuite-seatpool export-csv --out-dir ./csv_out
-gsuite-seatpool sync-directory --fqdn alpha.example.test --limit 50
-gsuite-seatpool allocate --target github --count 8 --max-per-domain-day 3
-gsuite-seatpool inbox-ingest --file message.eml
-gsuite-seatpool status
-```
+## Current limits
 
-## Operational Limits
+- Generation defaults to 50 but accepts larger positive counts; this is not a Google licensing entitlement. The offline mock retains a simulated 50-user limit for quota-error tests.
+- Explicit organization/domain linkage supports operator-declared shared planned capacity. This is local reservation accounting, not live Google license discovery. Legacy domains remain unlinked until explicitly associated.
+- New passwords use cryptographic randomness; reinitializing inventory preserves existing credentials. New database and CSV files are private (0600); CSV exports refuse existing destinations. Existing database permissions are preserved. SQLite/CSV credentials remain plaintext.
+- No-config endpoints are loopback mocks. Real Google use requires the production URL and credentials.
+- Safe Directory reads retry transient HTTP responses. User creation is not blindly retried.
 
-- **Cloud Identity Free Cap**: Hard ceiling of `50` user seats per domain. `generate_domain_seats()` and the mock Directory API reject requests above `50`.
-- **Per-Domain Daily Target Guard**: `allocate_round_robin()` tracks allocations in a rolling 24-hour window (`allocations.allocated_at`) and skips any domain that reaches `max_per_domain_day` for a given target service.
-- **Cleartext HTTP/1.1 Negotiation**: `build_http_session()` forces `http_version="v1"` on `http://` endpoints so `curl_cffi` TLS impersonation profiles do not emit `Upgrade: h2c` frames against local ASGI mock servers.
-
-## Test Suite
+## Verification
 
 ```bash
 python3 -m pytest
+python3 scripts/public-hygiene-gate.py --repo-root .
+git diff --check
 ```
 
-Offline unit and integration tests covering:
-- Registrar DNS zone CRUD, idempotent TXT verification, and catch-all MX/SPF presets
-- Deterministic seat generation, password policy compliance, 50-seat ceiling enforcement, and Admin Console CSV formatting
-- Google Admin SDK Directory v1 user provisioning, duplicate detection (`409`), and 50-seat quota exhaustion (`403`)
-- RFC5322 multipart MIME parsing, 6-digit OTP extraction, and verification URL polling
-- Multi-domain round-robin seat allocation and per-domain daily target budget enforcement
+Tests run offline with temporary databases and provider doubles. They do not certify live Google, Cloudflare, or registrar access. Before publishing, audit tracked files and reachable history; the hygiene gate checks known patterns, not every possible secret. See [SECURITY.md](SECURITY.md).

@@ -7,7 +7,18 @@ from .client import (
     build_http_session,
 )
 
+from .adapters import (
+    CloudflareDnsProvider,
+    ManualDnsProvider,
+    RegistrarDnsProvider,
+    create_dns_provider,
+)
+
 __all__ = [
+    "CloudflareDnsProvider",
+    "RegistrarDnsProvider",
+    "ManualDnsProvider",
+    "create_dns_provider",
     "CATCHALL_PRESETS",
     "SUPPORTED_RECORD_TYPES",
     "DnsError",

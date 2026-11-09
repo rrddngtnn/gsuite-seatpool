@@ -17,4 +17,14 @@ csv_out/
 backups/
 evidence/
 specs/
+*.env
+.env.*
+!.env.example
+seatpool.toml
+private/
+credentials/
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 plans/

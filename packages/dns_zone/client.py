@@ -184,3 +184,10 @@ class DnsZoneClient:
                 )
                 results.append({"action": "created", "record": rec})
         return results
+
+
+def create_dns_provider(config, *, session=None):
+    """Compatibility import for the DNS adapter factory."""
+    from .adapters import create_dns_provider as factory
+
+    return factory(config, session=session)

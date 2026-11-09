@@ -1,0 +1,18 @@
+schema_version = 1
+db = "gsuite_seatpool.db"
+catchall_target = "master@example.test"
+
+[dns]
+provider = "manual"
+# Cloudflare: provider = "cloudflare", zone_id = "your-zone-id",
+# token_env = "CLOUDFLARE_API_TOKEN".
+# Registrar: provider = "registrar", base_url = "https://registrar.example.test",
+# email_env = "REGISTRAR_EMAIL", password_env = "REGISTRAR_PASSWORD".
+
+[directory]
+base_url = "https://admin.googleapis.com"
+# Supply GOOGLE_DIRECTORY_TOKEN in the environment, or configure:
+# authorized_user_file = "./private/authorized-user.json"
+# Or service_account_file plus delegated_admin for domain-wide delegation.
+# service_account_file = "./private/service-account.json"
+# delegated_admin = "admin@example.test"

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import datetime
 import sqlite3
 
-from .store import log_event, utcnow
+from .store import utcnow
 
 
 @dataclass
@@ -55,75 +55,80 @@ def allocate_round_robin(
     if count <= 0:
         return res
 
-    domains = [
-        r["fqdn"]
-        for r in db.execute(
-            "SELECT fqdn FROM tenants WHERE status NOT IN ('suspended', 'dead') ORDER BY id"
-        ).fetchall()
-    ]
-    if not domains:
-        return res
+    # Acquire the write reservation before any eligibility/budget/seat reads.
+    # Do not call store.log_event here: its commit would release this lock.
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        domains = [
+            r["fqdn"]
+            for r in db.execute(
+                "SELECT fqdn FROM tenants WHERE status NOT IN ('suspended', 'dead') ORDER BY id"
+            ).fetchall()
+        ]
+        if not domains:
+            return res
 
-    exhausted: set[str] = set()
-    cursor = 0
+        exhausted: set[str] = set()
+        cursor = 0
 
-    while len(res.allocated) < count and len(exhausted) < len(domains):
-        fqdn = domains[cursor % len(domains)]
-        cursor += 1
-        if fqdn in exhausted:
-            continue
+        while len(res.allocated) < count and len(exhausted) < len(domains):
+            fqdn = domains[cursor % len(domains)]
+            cursor += 1
+            if fqdn in exhausted:
+                continue
 
-        used = domain_daily_usage(db, fqdn, target, window_hours=window_hours)
-        if used >= max_per_domain_day:
-            exhausted.add(fqdn)
-            res.skipped_domains[fqdn] = f"daily_budget_exhausted ({used}/{max_per_domain_day})"
-            log_event(
-                db,
-                fqdn,
-                "domain_budget_guard",
-                f"target={target} used={used}/{max_per_domain_day}",
+            used = domain_daily_usage(db, fqdn, target, window_hours=window_hours)
+            if used >= max_per_domain_day:
+                exhausted.add(fqdn)
+                res.skipped_domains[fqdn] = f"daily_budget_exhausted ({used}/{max_per_domain_day})"
+                db.execute(
+                    "INSERT INTO events(ts, fqdn, kind, detail) VALUES(?, ?, ?, ?)",
+                    (utcnow(), fqdn, "domain_budget_guard",
+                     f"target={target} used={used}/{max_per_domain_day}"[:2000]),
+                )
+                continue
+
+            seat = db.execute(
+                "SELECT s.id, s.fqdn, s.seat_index, s.email, s.password, s.first_name, s.last_name "
+                "FROM seats s "
+                "WHERE s.fqdn=? AND s.status='provisioned' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM allocations a WHERE a.seat_id = s.id AND a.target = ?"
+                ") "
+                "ORDER BY s.allocated_count ASC, s.seat_index ASC LIMIT 1",
+                (fqdn, target),
+            ).fetchone()
+
+            if seat is None:
+                exhausted.add(fqdn)
+                res.skipped_domains[fqdn] = "no_unallocated_seat_for_target"
+                continue
+
+            now = utcnow()
+            db.execute(
+                "INSERT INTO allocations(seat_id, fqdn, email, target, allocated_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (seat["id"], seat["fqdn"], seat["email"], target, now),
             )
-            continue
+            db.execute(
+                "UPDATE seats SET allocated_count = allocated_count + 1, last_used_at = ? WHERE id = ?",
+                (now, seat["id"]),
+            )
+            item = {
+                "seat_id": int(seat["id"]),
+                "fqdn": seat["fqdn"],
+                "seat_index": int(seat["seat_index"]),
+                "email": seat["email"],
+                "password": seat["password"],
+                "first_name": seat["first_name"],
+                "last_name": seat["last_name"],
+                "target": target,
+                "allocated_at": now,
+            }
+            res.allocated.append(item)
+            db.execute(
+                "INSERT INTO events(ts, fqdn, kind, detail) VALUES(?, ?, ?, ?)",
+                (utcnow(), fqdn, "seat_allocated", f"{seat['email']} -> {target}"[:2000]),
+            )
 
-        seat = db.execute(
-            "SELECT s.id, s.fqdn, s.seat_index, s.email, s.password, s.first_name, s.last_name "
-            "FROM seats s "
-            "WHERE s.fqdn=? AND s.status IN ('ready', 'provisioned') "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM allocations a WHERE a.seat_id = s.id AND a.target = ?"
-            ") "
-            "ORDER BY s.allocated_count ASC, s.seat_index ASC LIMIT 1",
-            (fqdn, target),
-        ).fetchone()
-
-        if seat is None:
-            exhausted.add(fqdn)
-            res.skipped_domains[fqdn] = "no_unallocated_seat_for_target"
-            continue
-
-        now = utcnow()
-        db.execute(
-            "INSERT INTO allocations(seat_id, fqdn, email, target, allocated_at) "
-            "VALUES(?, ?, ?, ?, ?)",
-            (seat["id"], seat["fqdn"], seat["email"], target, now),
-        )
-        db.execute(
-            "UPDATE seats SET allocated_count = allocated_count + 1, last_used_at = ? WHERE id = ?",
-            (now, seat["id"]),
-        )
-        db.commit()
-        item = {
-            "seat_id": int(seat["id"]),
-            "fqdn": seat["fqdn"],
-            "seat_index": int(seat["seat_index"]),
-            "email": seat["email"],
-            "password": seat["password"],
-            "first_name": seat["first_name"],
-            "last_name": seat["last_name"],
-            "target": target,
-            "allocated_at": now,
-        }
-        res.allocated.append(item)
-        log_event(db, fqdn, "seat_allocated", f"{seat['email']} -> {target}")
-
-    return res
+        return res
