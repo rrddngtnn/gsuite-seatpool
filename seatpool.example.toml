@@ -16,3 +16,13 @@ base_url = "https://admin.googleapis.com"
 # Or service_account_file plus delegated_admin for domain-wide delegation.
 # service_account_file = "./private/service-account.json"
 # delegated_admin = "admin@example.test"
+
+# Optional mailbox-scoped TMail v1 HTTP ingestion (no local TMail dependency):
+# [mail]
+# provider = "tmail_v1"
+# url = "https://mail.example.test"
+# mailbox = "seat@example.test"
+# bearer_env = "MAIL_API_TOKEN"
+# max_pages = 10
+# Export MAIL_API_TOKEN, then run inbox-pull --limit 50.
+# Do not put the token in this file or use an administrator token.

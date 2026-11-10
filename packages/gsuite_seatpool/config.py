@@ -69,9 +69,10 @@ def load_config(path=None, *, environ=None, overrides=None):
         if not isinstance(mail, dict):
             raise ValueError("mail must be a table")
         provider = mail.get("provider", "imap")
-        if provider not in ("imap", "rest"):
-            raise ValueError("mail.provider must be imap or rest")
-        allowed = ({"provider", "url", "bearer_env", "max_pages"} if provider == "rest" else
+        if provider not in ("imap", "rest", "tmail_v1"):
+            raise ValueError("mail.provider must be imap, rest or tmail_v1")
+        allowed = ({"provider", "url", "bearer_env", "max_pages", "mailbox"} if provider == "tmail_v1" else
+                   {"provider", "url", "bearer_env", "max_pages"} if provider == "rest" else
                    {"provider", "host", "username_env", "password_env", "mailbox", "port"})
         if mail.keys() - allowed:
             raise ValueError("mail has unsupported fields; use environment references for credentials")
@@ -84,6 +85,9 @@ def load_config(path=None, *, environ=None, overrides=None):
                     raise ValueError("mail.max_pages must be an integer between 1 and 100")
             elif not isinstance(value, str) or not value.strip():
                 raise ValueError(f"mail.{key} must be a non-empty string")
+        if provider == "tmail_v1":
+            from catchall_mail.tmail_v1 import TMailV1Source
+            TMailV1Source.validate_config(mail)
         if provider == "rest":
             from catchall_mail.rest_source import RestSource
             RestSource._origin(mail.get("url"))

@@ -36,6 +36,32 @@ def ingest_imap_messages(db, messages) -> int:
     return ingested
 
 
+def ingest_tmail_page(db, account_id, messages, cursor, pending) -> None:
+    """Commit one bounded scan segment, including unconsumed page metadata.
+
+    Schema is initialized by the source before reading scan state. Failures
+    roll back the complete segment; previously committed pages remain durable.
+    """
+    with db:
+        for item in messages:
+            msg = item.message
+            db.execute(
+                "INSERT INTO tmail_checkpoints(account_id, id) VALUES (?, ?)",
+                (account_id, item.id),
+            )
+            db.execute(
+                "INSERT INTO inbox_messages(recipient, domain, sender, subject, body_text, "
+                "otp_json, urls_json, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (msg.recipient, msg.recipient.split('@', 1)[1], msg.sender, msg.subject,
+                 msg.body_text, json.dumps(msg.otp_codes), json.dumps(msg.urls), item.received),
+            )
+        db.execute(
+            "INSERT INTO tmail_scans(account_id, cursor, pending) VALUES (?, ?, ?) "
+            "ON CONFLICT(account_id) DO UPDATE SET cursor=excluded.cursor, pending=excluded.pending",
+            (account_id, cursor, json.dumps(pending)),
+        )
+
+
 def ingest_rest_messages(db, messages) -> int:
     """Atomically ingest REST IDs in a namespace separate from IMAP UIDs."""
     db.execute("""CREATE TABLE IF NOT EXISTS rest_checkpoints (

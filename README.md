@@ -116,6 +116,62 @@ Run `inbox-pull --limit 50` with your configuration. The endpoint receives GET r
 
 `next` can be a relative or same-origin HTTPS pagination link. Redirects and cross-origin pagination are rejected. Persistent `(account_id, id)` checkpoints and inbox records commit atomically. Account identity is derived from the exact endpoint URL: keep it stable and do not embed credentials in it. Token rotation through the same environment reference does not duplicate messages. Limits and page bounds prevent unbounded traversal; this contract does not match every mailbox vendor without an external adapter.
 
+## TMail v1 ingestion
+
+This optional HTTP adapter implements the mailbox-scoped v1 contract; it has no
+TMail source-tree, import, or deployment dependency. It does not provision mailboxes.
+Use a mailbox-scoped bearer token, not an administrator token:
+
+```toml
+[mail]
+provider = "tmail_v1"
+url = "https://mail.example.test"
+mailbox = "seat@example.test"
+bearer_env = "MAIL_API_TOKEN"
+max_pages = 10
+```
+
+Export the referenced token and run
+`gsuite-seatpool --config seatpool.toml inbox-pull --limit 50`. The URL must be
+an HTTPS origin without credentials, query, fragment, or a path prefix.
+GET `/v1/messages` returns at most 100 metadata records per page:
+
+```json
+{"messages": [{"id": "00000000-0000-4000-8000-000000000001", "size": 128, "envelope": {"from": "sender@example.test", "to": "seat@example.test", "received": "2026-01-01T00:00:00Z"}}], "cursor": null}
+```
+
+A non-null opaque cursor is sent as a query parameter on the same endpoint.
+GET `/v1/messages/{id}/raw` must return the exact RFC5322 bytes, matching `size`.
+IDs must be lowercase UUIDv4. Envelope recipient must match the configured
+mailbox (case-insensitive); missing or mismatched metadata fails the page before
+any raw fetch. The trusted envelope recipient overrides MIME `To`, `Delivered-To`,
+and `X-Original-To`. The sender and subject remain MIME content, not authenticated
+claims. The envelope's UTC received timestamp is stored with the inbox row.
+
+Requests disable redirects, use TLS verification, and have a 30-second socket
+timeout plus an elapsed-time check while streaming. List bodies are capped at
+1 MiB and raw bodies at 25 MiB. Errors omit URLs, tokens and response bodies.
+MIME is parsed as bytes, preserving declared non-UTF8 charsets. Invalid bytes in
+known charsets use replacement characters; unknown/unsupported charsets fail
+explicitly without advancing that scan segment.
+
+`--limit` bounds newly ingested messages (1..1000). `max_pages` bounds scan
+segments per invocation (1..100, default 10), including a resumed partial page;
+there are at most `max_pages` list requests and `limit` raw fetches. Persistent
+SQLite state stores pending page metadata and the next cursor together with
+inbox rows and deduplication IDs. Small limits resume the unconsumed part of a
+page rather than skipping it; already ingested IDs do not consume the message
+limit. This advances through old pages across bounded calls instead of repeatedly
+starting at the first page. After the final page is consumed, the next invocation
+starts a new sweep to discover later arrivals.
+
+Each segment commits atomically. A failed segment is retryable; earlier successful
+pages remain committed even if the command later fails and emits no success count.
+Checkpoints are scoped by normalized HTTPS host/port and mailbox, independently
+of the bearer token, so token rotation does not duplicate messages. Run only one
+pull per mailbox/database at a time. Expired server cursors and permanently invalid
+MIME require operator intervention; they are not silently skipped.
+
 ## Packages
 
 | Package | Responsibility |

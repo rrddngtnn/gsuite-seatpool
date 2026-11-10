@@ -252,6 +252,12 @@ def cmd_inbox_pull(args) -> int:
 
     settings = args.settings.get("mail", {})
     provider = settings.get("provider")
+    if provider == "tmail_v1":
+        from catchall_mail.tmail_v1 import TMailV1Source
+        with open_db(args.db) as db:
+            ingested = TMailV1Source(settings).ingest(db, limit=args.limit)
+        print(json.dumps({"ingested": ingested}))
+        return 0
     if provider == "rest":
         source, ingest = RestSource(settings), ingest_rest_messages
     elif provider == "imap":
@@ -260,7 +266,7 @@ def cmd_inbox_pull(args) -> int:
                 raise ValueError(f"inbox-pull requires mail.{field}")
         source, ingest = ImapSource(settings), ingest_imap_messages
     else:
-        raise ValueError("inbox-pull requires mail.provider imap or rest")
+        raise ValueError("inbox-pull requires mail.provider imap, rest or tmail_v1")
     messages = source.pull_with_metadata(limit=args.limit)
     with open_db(args.db) as db:
         ingested = ingest(db, messages)
